@@ -388,6 +388,11 @@ def parse_headers(text):
             "mailfrom": clean_domain(mf.group(1).split("@")[-1]) if mf else None}
 
 
+FREE_MAIL = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com", "yahoo.com", "ymail.com",
+             "icloud.com", "me.com", "proton.me", "protonmail.com", "aol.com", "gmx.com", "mail.com", "zoho.com", "yandex.com",
+             "rediffmail.com"}
+
+
 def mail_check(dom_in, exp_in, hdr):
     rows = []
     add = lambda lv, c, t: rows.append((lv, c, t))
@@ -395,7 +400,12 @@ def mail_check(dom_in, exp_in, hdr):
     d = clean_domain(dom_in.split("@")[-1]) if dom_in.strip() else None
     d = d or (h and h["from"])
     exp = clean_domain(exp_in.split("@")[-1]) if exp_in.strip() else None
-    if d:
+    free = d in FREE_MAIL
+    if free:
+        add("info", "Free email service", f"{d} is a free email service. Domain checks cannot tell you who owns this address; anyone can register one in minutes.")
+        if exp and exp != d:
+            add("warn", "Free address", f"You expected a {exp} sender, but this uses a free address. A business email from a free address is a common scam sign.")
+    elif d:
         ea = email_audit(d)
         add("ok" if ea["verdict"] == "Low" else "warn", "Spoofing protection",
             f"{ea['verdict']} risk of being forged. " + "; ".join(f"{a}: {b}" for a, b in ea["rows"][:2]))
@@ -430,7 +440,9 @@ def mail_check(dom_in, exp_in, hdr):
     lv = [r[0] for r in rows]
     v = "🔴 Likely fake or unsafe" if "bad" in lv else "🟠 Suspicious: verify another way" if "warn" in lv else \
         "🟢 Likely genuine" if "ok" in lv else "⚪ Not enough information"
-    return v, rows
+    if free and v.startswith(("🟢", "⚪")):
+        v = "⚪ Free email address: the sender's identity cannot be confirmed"
+    return v, rows, d, free
 
 
 def run_scan(domains, use_subs):
@@ -592,6 +604,16 @@ def go_ask(focus, seed):
     st.rerun()
 
 
+def go_scan(domain):
+    st.session_state.page, st.session_state.doms_txt = "scan", domain
+    st.rerun()
+
+
+def go_mail(domain):
+    st.session_state.page, st.session_state.mail_dom, st.session_state.mail_res = "mail", domain, None
+    st.rerun()
+
+
 def render_results(res, skipped):
     allf = [x for d in res for x in d["findings"]]
     worst = min(res, key=lambda d: d["score"])
@@ -629,8 +651,11 @@ def render_results(res, skipped):
             st.markdown(html_table(["Host", "Grade", "Score", "Server", "Cert days left", "Findings"],
                                    [[esc(h["Host"]), badge(h["Grade"]), h["Score"], esc(h["Server"]), h["Cert days left"], h["Findings"]]
                                     for h in d["hosts"]]), unsafe_allow_html=True)
-            if st.button("💬 Ask AI about this domain", key=f"ask_{d['domain']}"):
+            ba, bb, _ = st.columns([1, 1, 1])
+            if ba.button("💬 Ask AI about this domain", key=f"ask_{d['domain']}"):
                 go_ask(d["domain"], f"Explain the exposure findings for {d['domain']}: what matters most, why, and the top fixes in order.")
+            if bb.button("📧 Check email authenticity", key=f"mail_{d['domain']}"):
+                go_mail(d["domain"])
             suite_links(d)
     csv, xlsx = exports(res)
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -837,8 +862,8 @@ def render_mail():
     st.caption("A: check the sender's domain. B: paste the email headers. Use either or both. Headers are processed in your session only and never stored.")
     with st.form("mailf"):
         c1, c2 = st.columns(2)
-        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@xyz.com or xyz.com")
-        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="xyz.com")
+        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@ge.com or ge.com")
+        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="ge.com")
         hdr = st.text_area("Email headers (optional)", key="mail_hdr", height=130,
                            placeholder="Gmail: Show original. Outlook: View message source. Paste the headers here.")
         b1, b2, _ = st.columns([1, 1, 3])
@@ -851,11 +876,17 @@ def render_mail():
             with st.spinner("Checking..."):
                 st.session_state.mail_res = mail_check(dom, exp, hdr)
     if st.session_state.get("mail_res"):
-        v, rows = st.session_state.mail_res
+        v, rows, dchk, free = st.session_state.mail_res
         st.markdown(f"### {v}")
         sym = {"ok": "✅", "warn": "⚠️", "bad": "❌", "info": "ℹ️"}
         st.markdown(html_table(["", "Check", "Detail"], [[sym[lv], esc(c), esc(t)] for lv, c, t in rows]), unsafe_allow_html=True)
         st.caption("A pass shows who sent a message, not that the sender is trustworthy. If money, passwords or attachments are involved, confirm through another channel.")
+        x1, x2, _ = st.columns([2, 2, 1])
+        if dchk and not free and x1.button("🔎 Run a full exposure scan on this domain", key="mail_to_scan"):
+            go_scan(dchk)
+        if x2.button("💬 Ask AI what to do next", key="mail_to_ask"):
+            go_ask("All domains", f"An email check gave this verdict: {v}. Findings: " + "; ".join(f"{c}: {t}" for _, c, t in rows)
+                   + ". What should I do next? Keep it practical and short.")
 
 
 # ----------------------------------------------------------------------------
@@ -876,6 +907,8 @@ FAQ = [
     ("What do the suite links do?", "When a server version is exposed, links open EOL Radar, PatchPilot and the Risk Calculator. Prefilling only works where the target app reads values from the link; otherwise the app simply opens."),
     ("How do I use AI?", f"Turn on AI Assistant in the sidebar. Gemini and Groq offer a free limited key ({AI_SESSION_CAP} requests per visit plus a shared daily limit). Or paste your own key; ChatGPT and Claude need your own key. AI explains results and never changes the grade."),
     ("Limits?", f"Up to {DOMAINS_MAX} domains per run and {SUBS_MAX} subdomains each, to keep the tool quick and stop misuse. Results are cached for an hour."),
+    ("Why does a Gmail or Outlook sender say the identity cannot be confirmed?", "Free email services are healthy domains that anyone can sign up to, so their domain checks say nothing about the person behind the address. The tool says so instead of showing a misleading pass, and warns when you expected a company domain but the address is a free one."),
+    ("What do the buttons between pages do?", "Email Check can open a full exposure scan on the sender's domain (prefilled), Scan can open Email Check for a domain, and Email Check can send its verdict and reasons (never your pasted headers) to Ask AI."),
     ("How do I start over?", "Use Clear / New scan on the Scan page. It wipes results, the domain box, the uploaded file and the AI chat, and keeps your AI settings."),
 ]
 SCORING = [
