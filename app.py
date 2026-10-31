@@ -260,6 +260,7 @@ def subdomains(domain):
 
 def rdap(domain):
     """Domain registration data (expiry, registrar, nameservers, DNSSEC) from public RDAP. Empty dict if unavailable."""
+    domain = reg_domain(domain)
     hit = _CACHE.get(("rdap", domain))
     if hit and time.time() - hit[0] < 21600:
         return hit[1]
@@ -290,6 +291,14 @@ def rdap(domain):
     if info:   # never cache a failed lookup
         _CACHE[("rdap", domain)] = (time.time(), info)
     return info
+
+
+def reg_domain(d):
+    """Registrable (organisation) domain: gds.ey.com -> ey.com, mail.bbc.co.uk -> bbc.co.uk."""
+    p = d.split(".")
+    if len(p) >= 3 and len(p[-1]) == 2 and p[-2] in ("co", "com", "org", "net", "gov", "ac", "edu"):
+        return ".".join(p[-3:])
+    return ".".join(p[-2:])
 
 
 def txt(name):
@@ -325,6 +334,8 @@ def email_audit(domain):
     mail = bool(mx)
     spf = [t for t in txt(domain) if t.lower().startswith("v=spf1")]
     dm = [t for t in txt("_dmarc." + domain) if t.lower().startswith("v=dmarc1")]
+    if not dm and reg_domain(domain) != domain:   # subdomains inherit the organisation domain's DMARC policy
+        dm = [t for t in txt("_dmarc." + reg_domain(domain)) if t.lower().startswith("v=dmarc1")]
     tags = {}
     for part in (dm[0].split(";") if dm else []):
         k, _, v = part.partition("=")
@@ -379,7 +390,7 @@ def email_audit(domain):
 
 
 def lookalike(a, b):
-    if not b or a == b:
+    if not b or a == b or a.endswith("." + b) or b.endswith("." + a):
         return None
     lab = lambda x: x.split(".")[-2] if "." in x else x
     norm = lambda x: lab(x).translate(str.maketrans("0135", "oles")).replace("rn", "m").replace("vv", "w").replace("-", "")
@@ -442,7 +453,8 @@ def mail_check(dom_in, exp_in, hdr):
             if lk:
                 add("bad", "Look-alike check", f"{d} vs expected {exp}: {lk}")
             elif exp:
-                add("ok" if d == exp else "warn", "Look-alike check", "Matches the expected domain" if d == exp else f"Not the expected domain {exp}, though no look-alike pattern found")
+                rel = d == exp or d.endswith("." + exp) or exp.endswith("." + d)
+                add("ok" if rel else "warn", "Look-alike check", ("Matches the expected domain" if d == exp else f"Same organisation as {exp} (subdomain relationship)") if rel else f"Not the expected domain {exp}, though no look-alike pattern found")
             weak = ea["verdict"] != "Low"
             lead = {"High": "Yes, easily. ", "Medium": "Partly. ", "Low": "Unlikely. "}[ea["verdict"]]
             add("note" if weak else "ok", "Can it be forged?", lead + "; ".join(f"{x}: {y}" for x, y in ea["rows"][:2]))
