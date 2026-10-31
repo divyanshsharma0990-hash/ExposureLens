@@ -401,26 +401,29 @@ def mail_check(dom_in, exp_in, hdr):
     d = d or (h and h["from"])
     exp = clean_domain(exp_in.split("@")[-1]) if exp_in.strip() else None
     free = d in FREE_MAIL
+    weak, fi = False, None
     if free:
         add("info", "Free email service", f"{d} is a free email service. Domain checks cannot tell you who owns this address; anyone can register one in minutes.")
         if exp and exp != d:
             add("warn", "Free address", f"You expected a {exp} sender, but this uses a free address. A business email from a free address is a common scam sign.")
     elif d:
         ea = email_audit(d)
-        add("ok" if ea["verdict"] == "Low" else "warn", "Spoofing protection",
-            f"{ea['verdict']} risk of being forged. " + "; ".join(f"{a}: {b}" for a, b in ea["rows"][:2]))
         w = rdap(d)
+        mail_t = "has mail servers" if ea["mail"] else "no MX records (not normally a mail domain)"
         if w.get("registered"):
             age = (datetime.now(timezone.utc).date() - datetime.strptime(w["registered"], "%Y-%m-%d").date()).days
-            add("bad" if age < 30 else "warn" if age < 180 else "ok", "Domain age", f"Registered {w['registered']} ({age} days ago)")
+            add("bad" if age < 30 else "warn" if age < 180 else "ok", "Is the domain real?", f"Registered {w['registered']} ({age} days ago); {mail_t}")
         else:
-            add("info", "Domain age", "Not available (this registry does not publish it)")
-        add("ok" if ea["mail"] else "info", "Mail setup", "Has MX records" if ea["mail"] else "No MX records: not normally a mail-receiving domain")
+            add("info", "Is the domain real?", f"Registration date not available (this registry does not publish it); {mail_t}")
         lk = lookalike(d, exp)
         if lk:
             add("bad", "Look-alike check", f"{d} vs expected {exp}: {lk}")
         elif exp:
             add("ok" if d == exp else "warn", "Look-alike check", "Matches the expected domain" if d == exp else f"Not the expected domain {exp}, though no look-alike pattern found")
+        weak = ea["verdict"] != "Low"
+        lead = {"High": "Yes, easily. ", "Medium": "Partly. ", "Low": "Unlikely. "}[ea["verdict"]]
+        add("note" if weak else "ok", "Can it be forged?", lead + "; ".join(f"{x}: {y}" for x, y in ea["rows"][:2]))
+        fi = len(rows) - 1
     if h:
         if not h["found"]:
             add("warn", "Authentication results", "No Authentication-Results header found. Paste the full headers.")
@@ -437,8 +440,11 @@ def mail_check(dom_in, exp_in, hdr):
             add("warn", "Envelope sender", f"Sent via {sender}, which does not match the From domain {h['from']}")
         if d and h["from"] and not same(h["from"], d):
             add("warn", "Domain mismatch", f"Headers say From: {h['from']}, but you checked {d}")
+    if weak and h and fi is not None:
+        rows[fi] = ("info" if (h["found"] and h["dmarc"] == "pass") else "warn",) + rows[fi][1:]
     lv = [r[0] for r in rows]
     v = "🔴 Likely fake or unsafe" if "bad" in lv else "🟠 Suspicious: verify another way" if "warn" in lv else \
+        "🟡 The domain looks real, but it can be forged. Paste the email headers to confirm this message." if "note" in lv else \
         "🟢 Likely genuine" if "ok" in lv else "⚪ Not enough information"
     if free and v.startswith(("🟢", "⚪")):
         v = "⚪ Free email address: the sender's identity cannot be confirmed"
@@ -862,8 +868,8 @@ def render_mail():
     st.caption("A: check the sender's domain. B: paste the email headers. Use either or both. Headers are processed in your session only and never stored.")
     with st.form("mailf"):
         c1, c2 = st.columns(2)
-        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@xyz.com or xyz.com")
-        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="xyz.com")
+        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@ge.com or ge.com")
+        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="ge.com")
         hdr = st.text_area("Email headers (optional)", key="mail_hdr", height=130,
                            placeholder="Gmail: Show original. Outlook: View message source. Paste the headers here.")
         b1, b2, _ = st.columns([1, 1, 3])
@@ -875,10 +881,11 @@ def render_mail():
         else:
             with st.spinner("Checking..."):
                 st.session_state.mail_res = mail_check(dom, exp, hdr)
-    if st.session_state.get("mail_res"):
-        v, rows, dchk, free = st.session_state.mail_res
+    mr = st.session_state.get("mail_res")
+    if mr and len(mr) == 4:   # ignore results saved by an older version of the app
+        v, rows, dchk, free = mr
         st.markdown(f"### {v}")
-        sym = {"ok": "✅", "warn": "⚠️", "bad": "❌", "info": "ℹ️"}
+        sym = {"ok": "✅", "warn": "⚠️", "bad": "❌", "info": "ℹ️", "note": "🟡"}
         st.markdown(html_table(["", "Check", "Detail"], [[sym[lv], esc(c), esc(t)] for lv, c, t in rows]), unsafe_allow_html=True)
         st.caption("A pass shows who sent a message, not that the sender is trustworthy. If money, passwords or attachments are involved, confirm through another channel.")
         x1, x2, _ = st.columns([2, 2, 1])
@@ -902,6 +909,7 @@ FAQ = [
     ("Why is DKIM not scored?", "DKIM selectors cannot be listed from outside. The tool tries the selectors used by Google and Microsoft 365 or a list of common ones, so 'not found' may just mean a custom selector."),
     ("How does the Email Check page work?", "A: enter the sender's domain (and the domain you expected) to check spoofing protection, domain age, mail setup and look-alike patterns. B: paste the email headers to read the SPF, DKIM and DMARC results your own mail server recorded. You get one verdict with the reasons."),
     ("Can a 'likely genuine' result be wrong?", "Yes. A pass proves who sent the message, not that the sender is honest. A scammer can pass every check on their own look-alike domain, which is why the domain checks matter. Confirm money, password or attachment requests through another channel."),
+    ("Why does a real company's domain say it can be forged?", "Many large companies have not locked down SPF and DMARC, so anyone could send mail pretending to be them. The tool reports that as 🟡 (the domain is real but forgeable), not as suspicious. Paste the email headers: a DMARC pass proves this particular message came from them."),
     ("What happens to pasted headers?", "They are processed in your session and never stored. They are not sent to the AI unless you type them into the chat yourself."),
     ("What is in the PDF report?", "A one-page management summary (grade, expiry, spoofing risk, top fixes) followed by detail pages per domain with findings and hosts."),
     ("What do the suite links do?", "When a server version is exposed, links open EOL Radar, PatchPilot and the Risk Calculator. Prefilling only works where the target app reads values from the link; otherwise the app simply opens."),
