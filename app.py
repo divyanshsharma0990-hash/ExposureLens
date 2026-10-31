@@ -133,13 +133,14 @@ def clean_domain(s):
 
 
 def doh(name, typ):
-    """Google DNS-over-HTTPS. Returns (status, [(type, data)])."""
-    try:
-        j = requests.get("https://dns.google/resolve", params={"name": name, "type": typ},
-                         headers=UA, timeout=6).json()
-        return j.get("Status", 2), [(a.get("type"), a.get("data", "")) for a in j.get("Answer", [])]
-    except (requests.RequestException, ValueError):
-        return None, []
+    """DNS-over-HTTPS (Google, then Cloudflare). Returns (status, [(type, data)]); status None means the lookup failed."""
+    for url in ("https://dns.google/resolve", "https://cloudflare-dns.com/dns-query"):
+        try:
+            j = requests.get(url, params={"name": name, "type": typ}, headers={**UA, "Accept": "application/dns-json"}, timeout=6).json()
+            return j.get("Status", 2), [(x.get("type"), x.get("data", "")) for x in j.get("Answer", [])]
+        except (requests.RequestException, ValueError):
+            continue
+    return None, []
 
 
 def is_public(host):
@@ -230,7 +231,8 @@ def scan_host(host, is_root):
     if hit and time.time() - hit[0] < 3600:
         return hit[1]
     res = _scan_host(host, is_root)
-    _CACHE[(host, is_root)] = (time.time(), res)
+    if not (res and is_root and res["info"].get("email", {}).get("failed")):   # never cache a failed DNS lookup
+        _CACHE[(host, is_root)] = (time.time(), res)
     return res
 
 
@@ -263,7 +265,17 @@ def rdap(domain):
         return hit[1]
     info = {}
     try:
-        j = requests.get(f"https://rdap.org/domain/{domain}", headers=UA, timeout=10).json()
+        j = None
+        for u in [f"https://rdap.org/domain/{domain}"] + ([f"https://rdap.verisign.com/{domain.rsplit('.', 1)[-1]}/v1/domain/{domain}"]
+                                                           if domain.endswith((".com", ".net")) else []):
+            try:
+                j = requests.get(u, headers=UA, timeout=10).json()
+                if j.get("events"):
+                    break
+            except (requests.RequestException, ValueError):
+                continue
+        if not j:
+            raise ValueError("no rdap data")
         ev = {e.get("eventAction"): e.get("eventDate", "") for e in j.get("events", [])}
         info["registered"], info["expires"] = ev.get("registration", "")[:10], ev.get("expiration", "")[:10]
         if ev.get("expiration"):
@@ -304,7 +316,12 @@ def spf_count(rec, seen):
 def email_audit(domain):
     """SPF, DMARC, DKIM (common selectors), MTA-STS, TLS-RPT, BIMI and a spoofing-risk verdict."""
     f = []
-    mx = [d for t, d in doh(domain, "MX")[1] if t == 15]
+    st_mx, mxa = doh(domain, "MX")
+    if st_mx is None:
+        return {"verdict": "Unknown", "mail": False, "rows": [("DNS lookup", "failed, please try again")], "findings": [], "failed": True, "exists": None}
+    if st_mx == 3:
+        return {"verdict": "High", "mail": False, "rows": [("DNS", "domain does not exist")], "findings": [], "failed": False, "exists": False}
+    mx = [d for t, d in mxa if t == 15]
     mail = bool(mx)
     spf = [t for t in txt(domain) if t.lower().startswith("v=spf1")]
     dm = [t for t in txt("_dmarc." + domain) if t.lower().startswith("v=dmarc1")]
@@ -358,7 +375,7 @@ def email_audit(domain):
     rows = [("SPF", spf_t), ("DMARC", "missing" if not dm else f"p={p or '?'}, applies to {pct}% of mail"), ("DKIM", dk_t),
             ("MTA-STS", (sts or "missing") if mail else "not applicable"), ("TLS-RPT", "found" if rpt else "missing"),
             ("BIMI", "found" if bimi else "not set")]
-    return {"verdict": verdict, "mail": mail, "rows": rows, "findings": f}
+    return {"verdict": verdict, "mail": mail, "rows": rows, "findings": f, "failed": False, "exists": True}
 
 
 def lookalike(a, b):
@@ -401,29 +418,35 @@ def mail_check(dom_in, exp_in, hdr):
     d = d or (h and h["from"])
     exp = clean_domain(exp_in.split("@")[-1]) if exp_in.strip() else None
     free = d in FREE_MAIL
-    weak, fi = False, None
+    weak, fi, nx = False, None, False
     if free:
         add("info", "Free email service", f"{d} is a free email service. Domain checks cannot tell you who owns this address; anyone can register one in minutes.")
         if exp and exp != d:
             add("warn", "Free address", f"You expected a {exp} sender, but this uses a free address. A business email from a free address is a common scam sign.")
     elif d:
         ea = email_audit(d)
-        w = rdap(d)
-        mail_t = "has mail servers" if ea["mail"] else "no MX records (not normally a mail domain)"
-        if w.get("registered"):
-            age = (datetime.now(timezone.utc).date() - datetime.strptime(w["registered"], "%Y-%m-%d").date()).days
-            add("bad" if age < 30 else "warn" if age < 180 else "ok", "Is the domain real?", f"Registered {w['registered']} ({age} days ago); {mail_t}")
+        if ea.get("failed"):
+            add("info", "DNS lookup", "Could not reach DNS right now, so the domain could not be checked. Please try again.")
+        elif not ea["exists"]:
+            nx = True
+            add("bad", "Is the domain real?", f"{d} does not exist in public DNS. It cannot send or receive real mail, so a message claiming to come from it is fake.")
         else:
-            add("info", "Is the domain real?", f"Registration date not available (this registry does not publish it); {mail_t}")
-        lk = lookalike(d, exp)
-        if lk:
-            add("bad", "Look-alike check", f"{d} vs expected {exp}: {lk}")
-        elif exp:
-            add("ok" if d == exp else "warn", "Look-alike check", "Matches the expected domain" if d == exp else f"Not the expected domain {exp}, though no look-alike pattern found")
-        weak = ea["verdict"] != "Low"
-        lead = {"High": "Yes, easily. ", "Medium": "Partly. ", "Low": "Unlikely. "}[ea["verdict"]]
-        add("note" if weak else "ok", "Can it be forged?", lead + "; ".join(f"{x}: {y}" for x, y in ea["rows"][:2]))
-        fi = len(rows) - 1
+            w = rdap(d)
+            mail_t = "has mail servers" if ea["mail"] else "no MX records (not normally a mail domain)"
+            if w.get("registered"):
+                age = (datetime.now(timezone.utc).date() - datetime.strptime(w["registered"], "%Y-%m-%d").date()).days
+                add("bad" if age < 30 else "warn" if age < 180 else "ok", "Is the domain real?", f"Registered {w['registered']} ({age} days ago); {mail_t}")
+            else:
+                add("info", "Is the domain real?", f"Registration date not available (this registry does not publish it); {mail_t}")
+            lk = lookalike(d, exp)
+            if lk:
+                add("bad", "Look-alike check", f"{d} vs expected {exp}: {lk}")
+            elif exp:
+                add("ok" if d == exp else "warn", "Look-alike check", "Matches the expected domain" if d == exp else f"Not the expected domain {exp}, though no look-alike pattern found")
+            weak = ea["verdict"] != "Low"
+            lead = {"High": "Yes, easily. ", "Medium": "Partly. ", "Low": "Unlikely. "}[ea["verdict"]]
+            add("note" if weak else "ok", "Can it be forged?", lead + "; ".join(f"{x}: {y}" for x, y in ea["rows"][:2]))
+            fi = len(rows) - 1
     if h:
         if not h["found"]:
             add("warn", "Authentication results", "No Authentication-Results header found. Paste the full headers.")
@@ -446,6 +469,8 @@ def mail_check(dom_in, exp_in, hdr):
     v = "🔴 Likely fake or unsafe" if "bad" in lv else "🟠 Suspicious: verify another way" if "warn" in lv else \
         "🟡 The domain looks real, but it can be forged. Paste the email headers to confirm this message." if "note" in lv else \
         "🟢 Likely genuine" if "ok" in lv else "⚪ Not enough information"
+    if nx:
+        v = "🔴 Fake: this domain does not exist"
     if free and v.startswith(("🟢", "⚪")):
         v = "⚪ Free email address: the sender's identity cannot be confirmed"
     return v, rows, d, free
@@ -868,8 +893,8 @@ def render_mail():
     st.caption("A: check the sender's domain. B: paste the email headers. Use either or both. Headers are processed in your session only and never stored.")
     with st.form("mailf"):
         c1, c2 = st.columns(2)
-        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@xyz.com or xyz.com")
-        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="xyz.com")
+        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@ge.com or ge.com")
+        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="ge.com")
         hdr = st.text_area("Email headers (optional)", key="mail_hdr", height=130,
                            placeholder="Gmail: Show original. Outlook: View message source. Paste the headers here.")
         b1, b2, _ = st.columns([1, 1, 3])
@@ -909,6 +934,7 @@ FAQ = [
     ("Why is DKIM not scored?", "DKIM selectors cannot be listed from outside. The tool tries the selectors used by Google and Microsoft 365 or a list of common ones, so 'not found' may just mean a custom selector."),
     ("How does the Email Check page work?", "A: enter the sender's domain (and the domain you expected) to check spoofing protection, domain age, mail setup and look-alike patterns. B: paste the email headers to read the SPF, DKIM and DMARC results your own mail server recorded. You get one verdict with the reasons."),
     ("Can a 'likely genuine' result be wrong?", "Yes. A pass proves who sent the message, not that the sender is honest. A scammer can pass every check on their own look-alike domain, which is why the domain checks matter. Confirm money, password or attachment requests through another channel."),
+    ("What does 'Fake: this domain does not exist' mean?", "The domain has no DNS records at all, so it cannot send or receive real mail. Any message claiming to come from it is fake. If the DNS lookup itself fails, the tool says it could not check instead of guessing."),
     ("Why does a real company's domain say it can be forged?", "Many large companies have not locked down SPF and DMARC, so anyone could send mail pretending to be them. The tool reports that as 🟡 (the domain is real but forgeable), not as suspicious. Paste the email headers: a DMARC pass proves this particular message came from them."),
     ("What happens to pasted headers?", "They are processed in your session and never stored. They are not sent to the AI unless you type them into the chat yourself."),
     ("What is in the PDF report?", "A one-page management summary (grade, expiry, spoofing risk, top fixes) followed by detail pages per domain with findings and hosts."),
@@ -1018,7 +1044,7 @@ if page == "scan":
         if r:
             render_results(r, sk)
         else:
-            st.warning("No domain could be checked: " + ", ".join(sk))
+            st.warning("No domain could be checked: " + ", ".join(sk) + ". It does not resolve in public DNS, so it may not exist (or may be private). If it came in an email, try the Email Check page.")
 elif page == "mail":
     render_mail()
 elif page == "ask":
