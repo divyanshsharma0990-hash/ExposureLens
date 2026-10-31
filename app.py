@@ -431,8 +431,13 @@ def mail_check(dom_in, exp_in, hdr):
     add = lambda lv, c, t: rows.append((lv, c, t))
     h = parse_headers(hdr) if hdr.strip() else None
     d = clean_domain(dom_in.split("@")[-1]) if dom_in.strip() else None
+    if dom_in.strip() and not d:
+        fix = clean_domain(re.sub(r"[,\s]+", ".", dom_in.split("@")[-1].strip()))
+        add("info", "Domain format", f"'{dom_in.strip()}' is not a valid domain name." + (f" Did you mean {fix}?" if fix else " Check it for typos."))
     d = d or (h and h["from"])
     exp = clean_domain(exp_in.split("@")[-1]) if exp_in.strip() else None
+    if exp_in.strip() and not exp:
+        add("info", "Expected domain", f"'{exp_in.strip()}' is not a valid domain name, so it was ignored.")
     free = d in FREE_MAIL
     weak, fi, nx = False, None, False
     if free:
@@ -1000,8 +1005,8 @@ def render_mail():
     st.caption("A: check the sender's domain. B: paste the email headers. Use either or both. Headers are processed in your session only and never stored.")
     with st.form("mailf"):
         c1, c2 = st.columns(2)
-        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@ge.com or ge.com")
-        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="ge.com")
+        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@xyz.com or xyz.com")
+        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="xyz.com")
         hdr = st.text_area("Email headers (optional)", key="mail_hdr", height=130,
                            placeholder="Gmail: Show original. Outlook: View message source. Paste the headers here.")
         b1, b2, _ = st.columns([1, 1, 3])
