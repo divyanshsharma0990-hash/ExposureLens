@@ -1173,8 +1173,8 @@ def render_mail():
     st.caption("A: check the sender's domain. B: paste the headers or the full message source (links are checked too). Use either or both. Pasted text stays in your session, is never stored, and links are never opened.")
     with st.form("mailf"):
         c1, c2 = st.columns(2)
-        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@ge.com or ge.com")
-        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="ge.com")
+        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@xyz.com or xyz.com")
+        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="xyz.com")
         hdr = st.text_area("Email headers or full message source (optional)", key="mail_hdr", height=130,
                            placeholder="Gmail: Show original. Outlook: View message source. Paste everything (headers and body) to also check the links.")
         b1, b2, _ = st.columns([1, 1, 3])
