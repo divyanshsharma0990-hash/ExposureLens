@@ -27,7 +27,7 @@ from difflib import SequenceMatcher
 from email import message_from_string
 from email.utils import parseaddr
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import pandas as pd
 import requests
@@ -397,7 +397,7 @@ def email_audit(domain):
 def lookalike(a, b):
     if not b or a == b or a.endswith("." + b) or b.endswith("." + a):
         return None
-    lab = lambda x: x.split(".")[-2] if "." in x else x
+    lab = lambda x: reg_domain(x).split(".")[0]
     norm = lambda x: lab(x).translate(str.maketrans("0135", "oles")).replace("rn", "m").replace("vv", "w").replace("-", "")
     if lab(a) == lab(b):
         return "same name with a different domain ending"
@@ -465,6 +465,12 @@ def mail_check(dom_in, exp_in, hdr):
             elif exp:
                 rel = d == exp or d.endswith("." + exp) or exp.endswith("." + d)
                 add("ok" if rel else "warn", "Look-alike check", ("Matches the expected domain" if d == exp else f"Same organisation as {exp} (subdomain relationship)") if rel else f"Not the expected domain {exp}, though no look-alike pattern found")
+            if not exp:
+                bc = brand_check(d)
+                if bc and bc[0] == "genuine":
+                    add("ok", "Known brand", f"{d} is an official {bc[1]} domain ({bc[2]})")
+                elif bc:
+                    add("bad" if bc[3].startswith("look-alike characters") else "warn", "Brand look-alike", f"{d} looks like {bc[1]} ({bc[2]}): {bc[3]}. The official domain is {bc[2]}.")
             weak = ea["verdict"] != "Low"
             lead = {"High": "Yes, easily. ", "Medium": "Partly. ", "Low": "Unlikely. "}[ea["verdict"]]
             add("note" if weak else "ok", "Can it be forged?", lead + "; ".join(f"{x}: {y}" for x, y in ea["rows"][:2]))
@@ -489,6 +495,9 @@ def mail_check(dom_in, exp_in, hdr):
             add("warn", "Envelope sender", f"Sent via {sender}, which does not match the From domain {h['from']}")
         if d and h["from"] and not same(h["from"], d):
             add("warn", "Domain mismatch", f"Headers say From: {h['from']}, but you checked {d}")
+    if hdr.strip():
+        for lv_, c_, t_ in link_check(hdr):
+            add(lv_, c_, t_)
     if weak and h and fi is not None:
         rows[fi] = ("info" if (h["found"] and h["dmarc"] == "pass") else "warn",) + rows[fi][1:]
     lv = [r[0] for r in rows]
@@ -582,6 +591,141 @@ def own_match(a, b):
     return "No evidence of common ownership in public data (owners are often hidden)."
 
 
+BRANDS = {
+    "Microsoft": "microsoft.com live.com outlook.com office.com microsoftonline.com office365.com hotmail.com", "Google": "google.com gmail.com googlemail.com youtube.com",
+    "Apple": "apple.com icloud.com", "Amazon": "amazon.com amazon.in amazon.co.uk amazonaws.com", "PayPal": "paypal.com", "Facebook": "facebook.com meta.com fb.com",
+    "Instagram": "instagram.com", "WhatsApp": "whatsapp.com", "LinkedIn": "linkedin.com", "Netflix": "netflix.com", "Spotify": "spotify.com", "Dropbox": "dropbox.com",
+    "DocuSign": "docusign.com docusign.net", "Adobe": "adobe.com", "Zoom": "zoom.us", "Slack": "slack.com", "GitHub": "github.com", "GitLab": "gitlab.com",
+    "DHL": "dhl.com", "FedEx": "fedex.com", "UPS": "ups.com", "USPS": "usps.com", "Stripe": "stripe.com", "Shopify": "shopify.com", "eBay": "ebay.com",
+    "Walmart": "walmart.com", "Flipkart": "flipkart.com", "Paytm": "paytm.com", "PhonePe": "phonepe.com", "HDFC Bank": "hdfcbank.com", "ICICI Bank": "icicibank.com",
+    "State Bank of India": "sbi.co.in onlinesbi.sbi sbicard.com", "Axis Bank": "axisbank.com", "Kotak": "kotak.com", "Chase": "chase.com jpmorganchase.com jpmorgan.com",
+    "Bank of America": "bankofamerica.com", "Wells Fargo": "wellsfargo.com", "Citi": "citi.com citibank.com", "HSBC": "hsbc.com", "Barclays": "barclays.com",
+    "American Express": "americanexpress.com aexp.com", "Visa": "visa.com", "Mastercard": "mastercard.com", "Coinbase": "coinbase.com", "Binance": "binance.com",
+    "IRS": "irs.gov", "Income Tax India": "incometax.gov.in", "EY": "ey.com", "Deloitte": "deloitte.com", "PwC": "pwc.com", "KPMG": "kpmg.com",
+    "Accenture": "accenture.com", "Infosys": "infosys.com", "TCS": "tcs.com", "Wipro": "wipro.com", "HCLTech": "hcltech.com", "Cognizant": "cognizant.com",
+    "Salesforce": "salesforce.com", "Oracle": "oracle.com", "IBM": "ibm.com", "SAP": "sap.com", "Cisco": "cisco.com", "Okta": "okta.com", "Intuit": "intuit.com",
+    "Airbnb": "airbnb.com", "Uber": "uber.com", "Booking.com": "booking.com", "Disney": "disney.com disneyplus.com", "Steam": "steampowered.com steamcommunity.com",
+    "Telegram": "telegram.org t.me", "Twitter / X": "twitter.com x.com", "Zomato": "zomato.com", "Swiggy": "swiggy.com", "Jio": "jio.com", "Airtel": "airtel.in airtel.com",
+    "General Electric": "ge.com", "Samsung": "samsung.com"}
+BRAND_PAIRS = [(n, d) for n, ds in BRANDS.items() for d in ds.split()]
+SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd", "buff.ly", "rebrand.ly", "cutt.ly", "shorturl.at", "tiny.cc", "rb.gy"}
+RISKY = {21: "FTP", 23: "Telnet", 445: "SMB", 1433: "MSSQL", 3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL", 5900: "VNC", 6379: "Redis",
+         9200: "Elasticsearch", 27017: "MongoDB"}
+
+
+def brand_check(d):
+    """('genuine', brand, domain, '') for an official domain; ('lookalike', brand, official domain, reason) for an imitation; else None."""
+    for name, dom in BRAND_PAIRS:
+        if d == dom or d.endswith("." + dom):
+            return ("genuine", name, dom, "")
+    org = reg_domain(d)
+    for name, dom in BRAND_PAIRS:
+        lk = lookalike(org, dom)
+        if lk:
+            return ("lookalike", name, dom, lk)
+    return None
+
+
+def defang(u):
+    return re.sub(r"^http", "hxxp", u)[:70].replace(".", "[.]")
+
+
+def get_links(text):
+    """[(shown text, url)] from HTML anchors and bare URLs in an email body or full message source (decoded first)."""
+    chunks = [text]
+    try:
+        for part in message_from_string(text).walk():
+            if part.get_content_type() in ("text/html", "text/plain"):
+                p = part.get_payload(decode=True)
+                if p:
+                    chunks.append(p.decode(part.get_content_charset() or "utf-8", "ignore"))
+    except (ValueError, LookupError, AttributeError):
+        pass
+    found = {}
+    for c in chunks:
+        for href, shown in re.findall(r'<a\s[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', c, re.I | re.S):
+            found[href.strip()] = re.sub(r"<[^>]+>", "", shown).strip() or found.get(href.strip(), "")
+        for u in re.findall(r'https?://[^\s<>"\')\]]+', c):
+            found.setdefault(u, "")
+    return [(sh, u) for u, sh in found.items()]
+
+
+def link_check(text):
+    """Checks every link in pasted text. Links are never opened: only public DNS and registry lookups are made on the domains."""
+    links = get_links(text[:200000])
+    byhost = {}
+    for shown, url in links[:80]:
+        host = (urlparse(url).hostname or "").lower() if url.lower().startswith(("http://", "https://")) else ""
+        if host:
+            byhost.setdefault(host, []).append((shown, url))
+    if not byhost:
+        return [("info", "Links", "No links found. Paste the full message source (Gmail: Show original) to check links.")]
+    hosts = list(byhost)[:12]
+    orgs = list(dict.fromkeys(reg_domain(h) for h in hosts if not re.fullmatch(r"[\d.]+", h)))
+
+    def chk(o):
+        return o, doh(o, "A")[0] == 3, rdap(o), brand_check(o)
+    with ThreadPoolExecutor(6) as ex:
+        info = {o: (nx, w, bc) for o, nx, w, bc in ex.map(chk, orgs)}
+    rows = []
+    for h in hosts:
+        pairs, org = byhost[h], reg_domain(h)
+        if re.fullmatch(r"[\d.]+", h):
+            rows.append(("bad", "Link", f"Goes to a raw IP address: {defang(h)}"))
+            continue
+        for shown, url in pairs:
+            m = re.search(r"((?:[a-z0-9-]+\.)+[a-z]{2,})", shown.lower()) if shown and " " not in shown.strip() and len(shown) < 100 else None
+            if m and reg_domain(m.group(1)) != org:
+                rows.append(("bad", "Link text mismatch", f"Text shows {defang(shown)} but the link goes to {defang(h)}"))
+                break
+        if org in SHORTENERS:
+            rows.append(("warn", "Short link", f"{org} hides the real destination"))
+        if any(u.lower().startswith("http://") for _, u in pairs):
+            rows.append(("warn", "Plain HTTP", f"A link to {defang(h)} is not encrypted"))
+        nx, w, bc = info[org]
+        if nx:
+            rows.append(("bad", "Link domain", f"{defang(org)} does not exist"))
+        elif w.get("registered"):
+            age = (datetime.now(timezone.utc).date() - datetime.strptime(w["registered"], "%Y-%m-%d").date()).days
+            if age < 180:
+                rows.append(("bad" if age < 30 else "warn", "Link domain age", f"{defang(org)} was registered {age} days ago"))
+        if bc and bc[0] == "lookalike":
+            rows.append(("bad" if bc[3].startswith("look-alike characters") else "warn", "Link look-alike", f"{defang(org)} looks like {bc[1]} ({bc[2]}): {bc[3]}"))
+    head = ("info", "Links", f"{len(links)} link(s) to {len(byhost)} domain(s) checked. Links were not opened.")
+    return [head] + (rows or [("info", "Link check", "No suspicious links found by these checks.")])
+
+
+def exposed(domain):
+    """Ports, software and CVEs Shodan has already seen on the IP (Shodan InternetDB). Passive: nothing is sent to the target."""
+    hit = _CACHE.get(("exp", domain))
+    if hit and time.time() - hit[0] < 21600:
+        return hit[1]
+    out = []
+    if is_public(domain):
+        for ip in [d for t, d in doh(domain, "A")[1] if t == 1][:2]:
+            try:
+                r = requests.get(f"https://internetdb.shodan.io/{ip}", headers=UA, timeout=8)
+                j = r.json() if r.status_code == 200 else {}
+                if r.status_code in (200, 404):
+                    out.append({"ip": ip, "ports": j.get("ports", []) if r.status_code == 200 else None, "cpes": j.get("cpes", [])[:8],
+                                "tags": j.get("tags", []), "vulns": j.get("vulns", [])[:15]})
+            except (requests.RequestException, ValueError):
+                continue
+    if out:
+        _CACHE[("exp", domain)] = (time.time(), out)
+    return out
+
+
+def exposure_findings(d, data):
+    f = []
+    for e in data:
+        for p in [p for p in (e.get("ports") or []) if p in RISKY][:3]:
+            f.append(F(d, "High", f"Risky port {p} ({RISKY[p]}) seen open on {e['ip']} (Shodan, may be outdated)", "Close it or restrict it to a VPN or allow-list", 8))
+        if e.get("vulns"):
+            f.append(F(d, "Medium", f"Shodan lists {len(e['vulns'])} known CVEs for {e['ip']} (may be outdated)", "Verify the software versions and patch; triage in the Risk Calculator", 5))
+    return f
+
+
 def run_scan(domains, use_subs):
     notes = {d: [] for d in domains}
     with ThreadPoolExecutor(WORKERS) as ex:
@@ -596,6 +740,7 @@ def run_scan(domains, use_subs):
         out = list(ex.map(lambda p: scan_host(p[1], p[2]), plan))
         rd = dict(zip(domains, ex.map(rdap, domains)))
         own = dict(zip(domains, ex.map(ownership, domains)))
+        xs = dict(zip(domains, ex.map(exposed, domains)))
     res, skipped = [], []
     for d in domains:
         hosts = [(p[1], r) for p, r in zip(plan, out) if p[0] == d and r]
@@ -611,6 +756,12 @@ def run_scan(domains, use_subs):
         if not hosts:
             skipped.append(d)
             continue
+        xf = exposure_findings(d, xs[d])
+        if hosts and hosts[0][0] == d and xf:
+            r0 = dict(hosts[0][1])
+            r0["findings"] = r0["findings"] + xf
+            r0["score"] = max(0, r0["score"] - sum(x["Points"] for x in xf))
+            hosts[0] = (d, r0)
         scores = [r["score"] for _, r in hosts]
         ds = round(min(sum(scores) / len(scores), min(scores) + 20))
         hrows = [{"Host": h, "Score": r["score"], "Grade": grade(r["score"]), "Server": r["info"]["Server"] or "-",
@@ -621,7 +772,7 @@ def run_scan(domains, use_subs):
         top = next((x["Finding"] for x in fl if x["Points"]), "None found")
         res.append({"domain": d, "score": ds, "grade": grade(ds), "hosts": hrows, "findings": fl,
                     "worst": worst, "top": top, "notes": notes[d], "whois": rd[d],
-                    "email": hosts[0][1]["info"].get("email") if hosts[0][0] == d else None, "own": own[d]})
+                    "email": hosts[0][1]["info"].get("email") if hosts[0][0] == d else None, "own": own[d], "exposed": xs[d]})
     return res, skipped
 
 
@@ -713,6 +864,9 @@ def pdf_report(res):
                     f"({w.get('days', '-')} days) | DNSSEC: {w.get('dnssec', '-')}", body)]
         if d.get("own"):
             story += [P("Ownership: " + "; ".join(f"{k}: {v}" for k, v in own_rows(d["own"])), body)]
+        if d.get("exposed"):
+            story += [P("Exposed services (Shodan, may be outdated): " + "; ".join(
+                f"{e['ip']} ports {', '.join(map(str, e['ports'])) if e.get('ports') else 'none seen'}" for e in d["exposed"]), body)]
         if em:
             story += [P("Email security: " + "; ".join(f"{a} {b}" for a, b in em["rows"]) + f". Spoofing risk: {em['verdict']}.", body)]
         story += [Spacer(1, 6), Paragraph("Findings", ss["Heading3"]),
@@ -783,6 +937,20 @@ def render_results(res, skipped):
             if d.get("own"):
                 st.markdown("**Ownership (public data)**")
                 st.markdown(html_table(["Item", "Detail"], [[esc(k), esc(v)] for k, v in own_rows(d["own"])]), unsafe_allow_html=True)
+            if d.get("exposed"):
+                st.markdown("**Exposed services (Shodan, passive, may be outdated)**")
+                xr = []
+                for e in d["exposed"]:
+                    if e.get("ports") is None:
+                        xr.append([esc(e["ip"]), "No Shodan data (not scanned, or behind a CDN)", "-", "-", "-"])
+                        continue
+                    cv = " ".join(f'<a href="{RISK_URL.rstrip("/")}/?cve={c}" target="_blank" rel="noopener noreferrer">{c}</a>'
+                                  for c in e["vulns"][:8] if re.fullmatch(r"CVE-\d{4}-\d{4,7}", c))
+                    more = f" +{len(e['vulns']) - 8} more" if len(e["vulns"]) > 8 else ""
+                    xr.append([esc(e["ip"]), esc(", ".join(map(str, e["ports"])) or "none seen"),
+                               esc(", ".join(c.replace("cpe:/a:", "").replace("cpe:/o:", "").replace(":", " ") for c in e["cpes"][:6]) or "-"),
+                               esc(", ".join(e["tags"]) or "-"), (cv + more) or "-"])
+                st.markdown(html_table(["IP", "Ports seen", "Software", "Tags", "Known CVEs"], xr), unsafe_allow_html=True)
             if d.get("email"):
                 st.markdown("**Email security**")
                 st.markdown(html_table(["Check", "Result"], [[esc(a), esc(b)] for a, b in d["email"]["rows"]] + [["Spoofing risk", esc(d["email"]["verdict"])]]),
@@ -940,7 +1108,7 @@ def ai_call(cfg, prompt):
 
 
 def scan_context(res, focus="All domains"):
-    return json.dumps([{"domain": d["domain"], "score": d["score"], "grade": d["grade"], "ownership": d.get("own"),
+    return json.dumps([{"domain": d["domain"], "score": d["score"], "grade": d["grade"], "ownership": d.get("own"), "exposed": d.get("exposed"),
                         "findings": [{k: x[k] for k in ("Host", "Severity", "Finding", "Points")} for x in d["findings"][:25]]}
                        for d in res if focus in ("All domains", d["domain"])])[:9000]
 
@@ -1002,13 +1170,13 @@ def render_ask(ai_cfg, res):
 
 def render_mail():
     st.subheader("📧 Email Check: is this sender genuine?")
-    st.caption("A: check the sender's domain. B: paste the email headers. Use either or both. Headers are processed in your session only and never stored.")
+    st.caption("A: check the sender's domain. B: paste the headers or the full message source (links are checked too). Use either or both. Pasted text stays in your session, is never stored, and links are never opened.")
     with st.form("mailf"):
         c1, c2 = st.columns(2)
-        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@xyz.com or xyz.com")
-        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="xyz.com")
-        hdr = st.text_area("Email headers (optional)", key="mail_hdr", height=130,
-                           placeholder="Gmail: Show original. Outlook: View message source. Paste the headers here.")
+        dom = c1.text_input("Sender domain or email address", key="mail_dom", placeholder="abc@ge.com or ge.com")
+        exp = c2.text_input("Domain you expected (optional)", key="mail_exp", placeholder="ge.com")
+        hdr = st.text_area("Email headers or full message source (optional)", key="mail_hdr", height=130,
+                           placeholder="Gmail: Show original. Outlook: View message source. Paste everything (headers and body) to also check the links.")
         b1, b2, _ = st.columns([1, 1, 3])
         go = b1.form_submit_button("🔎 Check email", type="primary")
         b2.form_submit_button("🧹 Clear", on_click=clear_mail)
@@ -1050,6 +1218,9 @@ FAQ = [
     ("Why does a real company's domain say it can be forged?", "Many large companies have not locked down SPF and DMARC, so anyone could send mail pretending to be them. The tool reports that as 🟡 (the domain is real but forgeable), not as suspicious. Paste the email headers: a DMARC pass proves this particular message came from them."),
     ("What does the Ownership section show?", "Public clues about who is behind a domain: registrant and registrar, the company and parent company when Wikidata lists them for a well-known brand, mail provider, hosting network and the certificate's organisation. Many owners hide their details, so 'not available' is normal and never proof of anything."),
     ("What does 'Ownership match' mean?", "For a sender that looks like your expected brand, the tool compares the two domains. A shared registrant or certificate organisation suggests a common owner. Shared hosting or nameservers alone is weak evidence. 'No evidence' does not prove the domain is fake, and the look-alike warning stays."),
+    ("Does ExposureLens scan my ports?", "No. It never sends traffic to ports other than 443. Exposed services come from Shodan's free InternetDB, which shows what Shodan already saw on the IP. The data can be weeks old, and sites behind a CDN show the CDN's ports. 'No data' does not mean nothing is open."),
+    ("How does the link check work?", "Paste the full message source (Gmail: Show original) into the headers box. The tool lists every link and flags text that shows one site but goes to another, short links, raw IP links, plain HTTP, and domains that are brand new, missing or look like a known brand. It never opens a link."),
+    ("What is the brand check?", f"A built-in list of {len(BRANDS)} commonly impersonated brands with their official domains. A sender that matches one is marked official, and one that imitates one is flagged. Only well-known brands are covered, and unlisted legitimate domains can occasionally be flagged, so a warning means verify, not proof."),
     ("What happens to pasted headers?", "They are processed in your session and never stored. They are not sent to the AI unless you type them into the chat yourself."),
     ("What is in the PDF report?", "A one-page management summary (grade, expiry, spoofing risk, top fixes) followed by detail pages per domain with findings and hosts."),
     ("What do the suite links do?", "When a server version is exposed, links open EOL Radar, PatchPilot and the Risk Calculator. Prefilling only works where the target app reads values from the link; otherwise the app simply opens."),
@@ -1067,6 +1238,7 @@ SCORING = [
     ("Multiple or permissive SPF", "-8"), ("No HSTS", "-8"), ("Certificate expires in under 30 days", "-8"),
     ("SPF over 10 DNS lookups", "-5"), ("No CSP", "-5"), ("DMARC p=none", "-5"), ("DMARC pct under 100", "-2"),
     ("No clickjacking protection", "-3"), ("No X-Content-Type-Options", "-3"), ("No MTA-STS (mail domains)", "-2"), ("No CAA", "-2"),
+    ("Risky port seen open (RDP, SMB, Telnet, databases) via Shodan", "-8 each, up to 3 per IP"), ("Shodan lists known CVEs for the IP", "-5"),
 ]
 
 
